@@ -1,0 +1,81 @@
+name: Actualizar Radar de Acciones
+
+on:
+  schedule:
+    # 00:00 UTC = 21:00 America/Buenos_Aires (ART, UTC-3, sin horario de verano)
+    - cron: '0 0 * * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: radar-refresh
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Correr el pipeline (datos + calculo + render)
+        working-directory: scripts
+        run: |
+          mkdir -p ../data/cache ../output
+          python3 build_dataset.py
+          python3 make_compact.py
+          python3 render_dashboard.py
+
+      - name: Chequeo de calidad de datos (no publicar un dataset roto)
+        working-directory: scripts
+        run: |
+          python3 - <<'PYEOF'
+          import json, sys
+
+          with open("../output/dataset.json", encoding="utf-8") as f:
+              data = json.load(f)
+
+          assets = data.get("assets", [])
+          total = len(assets)
+          failed = [a for a in assets if a.get("data_confidence") == "Error" or a.get("price") is None]
+          n_failed = len(failed)
+          threshold = 15  # tolerancia: hasta ~17% de 86 activos puede fallar por caidas puntuales de una fuente
+
+          print(f"Activos: {total} | Con error/sin precio: {n_failed} (umbral: {threshold})")
+          if n_failed > threshold:
+              print("::error::Demasiados activos fallaron -- NO se publica este dataset. "
+                    "Revisar si Yahoo Finance/SEC EDGAR/FRED/BCRA cambiaron algo o estan caidos.")
+              for a in failed[:20]:
+                  print(f"  - {a.get('ticker')}: {a.get('errors')}")
+              sys.exit(1)
+          print("Chequeo OK, se publica.")
+          PYEOF
+
+      - name: Preparar salida para Pages
+        run: |
+          mkdir -p public
+          cp output/dashboard.html public/index.html
+
+      - name: Publicar en GitHub Pages
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./public
+          publish_branch: gh-pages
+
+      - name: Subir dataset.json y dataset_compact.json como artifact (para debug)
+        uses: actions/upload-artifact@v4
+        with:
+          name: dataset-${{ github.run_number }}
+          path: |
+            output/dataset.json
+            output/dataset_compact.json
+          retention-days: 14
